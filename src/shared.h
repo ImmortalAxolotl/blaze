@@ -21,6 +21,10 @@
 
 #define RADIANS_PER_DEGREE ((2.0f * PI) / 360.0f)
 
+#define SERVER_PROTOCOL_VERSION (754)
+
+#define SERVER_WORLD_VERSION (2586)
+
 typedef int8_t mc_byte;
 typedef int16_t mc_short;
 typedef int32_t mc_int;
@@ -147,6 +151,25 @@ enum direction {
     DIRECTION_ZERO, // not used in network
 };
 
+enum dye_colour {
+    DYE_COLOUR_WHITE,
+    DYE_COLOUR_ORANGE,
+    DYE_COLOUR_MAGENTA,
+    DYE_COLOUR_LIGHT_BLUE,
+    DYE_COLOUR_YELLOW,
+    DYE_COLOUR_LIME,
+    DYE_COLOUR_PINK,
+    DYE_COLOUR_GRAY,
+    DYE_COLOUR_LIGHT_GRAY,
+    DYE_COLOUR_CYAN,
+    DYE_COLOUR_PURPLE,
+    DYE_COLOUR_BLUE,
+    DYE_COLOUR_BROWN,
+    DYE_COLOUR_GREEN,
+    DYE_COLOUR_RED,
+    DYE_COLOUR_BLACK,
+};
+
 typedef struct {
     mc_short x;
     mc_short z;
@@ -180,6 +203,65 @@ typedef struct {
     mc_ushort z:4;
 } compact_chunk_block_pos;
 
+enum block_entity_type {
+    BLOCK_ENTITY_NULL,
+    BLOCK_ENTITY_BANNER,
+    BLOCK_ENTITY_BARREL,
+    BLOCK_ENTITY_BEACON,
+    BLOCK_ENTITY_BED,
+    BLOCK_ENTITY_BEEHIVE,
+    BLOCK_ENTITY_BELL,
+    BLOCK_ENTITY_BLAST_FURNACE,
+    BLOCK_ENTITY_BREWING_STAND,
+    BLOCK_ENTITY_CAMPFIRE,
+    BLOCK_ENTITY_CHEST,
+    BLOCK_ENTITY_COMMAND_BLOCK,
+    BLOCK_ENTITY_COMPARATOR,
+    BLOCK_ENTITY_CONDUIT,
+    BLOCK_ENTITY_DAYLIGHT_DETECTOR,
+    BLOCK_ENTITY_DISPENSER,
+    BLOCK_ENTITY_DROPPER,
+    BLOCK_ENTITY_ENCHANTING_TABLE,
+    BLOCK_ENTITY_ENDER_CHEST,
+    BLOCK_ENTITY_FURNACE,
+    BLOCK_ENTITY_HOPPER,
+    BLOCK_ENTITY_JIGSAW,
+    BLOCK_ENTITY_JUKEBOX,
+    BLOCK_ENTITY_LECTERN,
+    BLOCK_ENTITY_MOVING_PISTON,
+    BLOCK_ENTITY_SHULKER_BOX,
+    BLOCK_ENTITY_SIGN,
+    BLOCK_ENTITY_SKULL,
+    BLOCK_ENTITY_SMOKER,
+    BLOCK_ENTITY_SPAWNER,
+    BLOCK_ENTITY_STRUCTURE_BLOCK,
+    BLOCK_ENTITY_END_GATEWAY,
+    BLOCK_ENTITY_END_PORTAL,
+    BLOCK_ENTITY_TRAPPED_CHEST,
+};
+
+typedef struct {
+    unsigned char dye_colour;
+} block_entity_bed;
+
+#define BLOCK_ENTITY_IN_USE ((unsigned char) (1 << 0))
+
+typedef struct {
+    unsigned char type;
+    unsigned char flags;
+    compact_chunk_block_pos pos;
+
+    union {
+        block_entity_bed bed;
+    };
+} block_entity_base;
+
+typedef struct {
+    int type;
+    net_block_pos pos;
+    mc_int data;
+} level_event;
+
 typedef struct {
     chunk_section * sections[16];
     mc_ushort non_air_count[16];
@@ -192,12 +274,29 @@ typedef struct {
     mc_uint available_interest;
     unsigned flags;
 
-    // @TODO(traks) more changed blocks, better compression. Figure out when
-    // this limit can be exceeded. I highly doubt more than 16 blocks will be
-    // changed per chunk per tick due to players except if player density is
-    // very high.
-    compact_chunk_block_pos changed_blocks[16];
+    // @TODO(traks) more changed blocks, better compression. Can become very
+    // large due to redstone updates, carpet towers breaking, etc. This should
+    // probably grow dynamically. An alternative would be to store a bit array
+    // with a 1 if a block changed and a 0 otherwise. However, that has massive
+    // memory overhead.
+    compact_chunk_block_pos changed_blocks[200];
     mc_ubyte changed_block_count;
+
+    // @TODO(traks) allow more block entities. Possibly use an internally
+    // chained hashmap for this. The question is, where do we allocate this
+    // hashmap in? We may need some more general-purpose allocator. Could
+    // restrict to allocation sizes of 2^13, 2^12, 2^11, etc. and have separate
+    // linked lists for each. Maybe pull blocks from 2^13 list to 2^12 list,
+    // from 2^12 list to 2^11, etc. when they need more memory.
+
+    // @TODO(traks) flesh out all this block entity business. What if getting
+    // block entity fails? Remove block entities if block gets removed. Load
+    // block entities from region files. Send block entities to players. Send
+    // block entity updates to players.
+    block_entity_base block_entities[10];
+
+    level_event local_events[64];
+    mc_ubyte local_event_count;
 } chunk;
 
 #define CHUNKS_PER_BUCKET (32)
@@ -977,7 +1076,10 @@ enum block_type {
     BLOCK_CHISELED_NETHER_BRICKS,
     BLOCK_CRACKED_NETHER_BRICKS,
     BLOCK_QUARTZ_BRICKS,
-    BLOCK_TYPE_COUNT,
+    VANILLA_BLOCK_TYPE_COUNT,
+    // unknown block type used e.g. if you get a block from an unloaded chunk
+    BLOCK_UNKNOWN = VANILLA_BLOCK_TYPE_COUNT,
+    ACTUAL_BLOCK_TYPE_COUNT,
 };
 
 enum slab_type {
@@ -992,10 +1094,10 @@ enum axis {
     AXIS_Z,
 };
 
-enum attached_face {
-    ATTACHED_FACE_FLOOR,
-    ATTACHED_FACE_WALL,
-    ATTACHED_FACE_CEILING,
+enum attach_face {
+    ATTACH_FACE_FLOOR,
+    ATTACH_FACE_WALL,
+    ATTACH_FACE_CEILING,
 };
 
 enum bell_attachment {
@@ -1012,9 +1114,9 @@ enum wall_side {
 };
 
 enum redstone_side {
-    REDSTONE_SIDE_UP,
-    REDSTONE_SIDE_SIDE,
     REDSTONE_SIDE_NONE,
+    REDSTONE_SIDE_SIDE,
+    REDSTONE_SIDE_UP,
 };
 
 enum double_block_half {
@@ -1028,16 +1130,16 @@ enum block_half {
 };
 
 enum rail_shape {
-    RAIL_SHAPE_NORTH_SOUTH,
-    RAIL_SHAPE_EAST_WEST,
-    RAIL_SHAPE_ASCENDING_EAST,
-    RAIL_SHAPE_ASCENDING_WEST,
-    RAIL_SHAPE_ASCENDING_NORTH,
-    RAIL_SHAPE_ASCENDING_SOUTH,
-    RAIL_SHAPE_SOUTH_EAST,
-    RAIL_SHAPE_SOUTH_WEST,
-    RAIL_SHAPE_NORTH_WEST,
-    RAIL_SHAPE_NORTH_EAST,
+    RAIL_SHAPE_Z,
+    RAIL_SHAPE_X,
+    RAIL_SHAPE_ASCENDING_POS_X,
+    RAIL_SHAPE_ASCENDING_NEG_X,
+    RAIL_SHAPE_ASCENDING_NEG_Z,
+    RAIL_SHAPE_ASCENDING_POS_Z,
+    RAIL_SHAPE_POS_Z_POS_X,
+    RAIL_SHAPE_POS_Z_NEG_X,
+    RAIL_SHAPE_NEG_Z_NEG_X,
+    RAIL_SHAPE_NEG_Z_POS_X,
 };
 
 enum bed_part {
@@ -1133,6 +1235,9 @@ enum fluid_level {
     FLUID_LEVEL_FALLING,
     // @NOTE(traks) there are 7 more possible values for fluid levels, but
     // vanilla Minecraft doesn't actually seem to do anything with these
+
+    // custom fluid level
+    FLUID_LEVEL_NONE,
 };
 
 typedef struct {
@@ -1158,25 +1263,93 @@ typedef struct {
 } block_box;
 
 typedef struct {
-    float min_a;
-    float min_b;
-    float max_a;
-    float max_b;
-} block_box_face;
-
-typedef struct {
     unsigned char box_count;
-
-    // bit flags indexed by direction of full faces
-    unsigned char full_face_flags;
-
+    unsigned char flags;
     block_box boxes[8];
 } block_model;
 
+// @NOTE(traks) some functions don't return a block model index, but a block
+// model that isn't associated to an index. We need to test these against
+// full-ness.
+#define BLOCK_MODEL_IS_FULL ((unsigned char) (0x1 << 0))
+
 enum block_model {
-    BLOCK_MODEL_FULL,
     BLOCK_MODEL_EMPTY,
+    BLOCK_MODEL_Y_1,
+    BLOCK_MODEL_Y_2,
+    BLOCK_MODEL_Y_3,
+    BLOCK_MODEL_Y_4,
+    BLOCK_MODEL_Y_5,
+    BLOCK_MODEL_Y_6,
+    BLOCK_MODEL_Y_7,
+    BLOCK_MODEL_Y_8,
+    BLOCK_MODEL_Y_9,
+    BLOCK_MODEL_Y_10,
+    BLOCK_MODEL_Y_11,
+    BLOCK_MODEL_Y_12,
+    BLOCK_MODEL_Y_13,
+    BLOCK_MODEL_Y_14,
+    BLOCK_MODEL_Y_15,
+    BLOCK_MODEL_FULL,
+    BLOCK_MODEL_FLOWER_POT,
+    BLOCK_MODEL_CACTUS,
+    BLOCK_MODEL_COMPOSTER,
+    BLOCK_MODEL_HONEY_BLOCK,
+    BLOCK_MODEL_FENCE_GATE_FACING_X,
+    BLOCK_MODEL_FENCE_GATE_FACING_Z,
+    BLOCK_MODEL_CENTRED_BAMBOO,
+    // 16 possible options, bit order: pos x, neg x, pos z, neg z
+    BLOCK_MODEL_PANE_CENTRE,
+    BLOCK_MODEL_PANE_NEG_Z,
+    BLOCK_MODEL_PANE_POS_Z,
+    BLOCK_MODEL_PANE_Z,
+    BLOCK_MODEL_PANE_NEG_X,
+    BLOCK_MODEL_PANE_NEG_X_NEG_Z,
+    BLOCK_MODEL_PANE_NEG_X_POS_Z,
+    BLOCK_MODEL_PANE_NEG_X_Z,
+    BLOCK_MODEL_PANE_POS_X,
+    BLOCK_MODEL_PANE_POS_X_NEG_Z,
+    BLOCK_MODEL_PANE_POS_X_POS_Z,
+    BLOCK_MODEL_PANE_POS_X_Z,
+    BLOCK_MODEL_PANE_X,
+    BLOCK_MODEL_PANE_X_NEG_Z,
+    BLOCK_MODEL_PANE_X_POS_Z,
+    BLOCK_MODEL_PANE_X_Z,
+    // 16 possible options, bit order: pos x, neg x, pos z, neg z
+    BLOCK_MODEL_FENCE_CENTRE,
+    BLOCK_MODEL_FENCE_NEG_Z,
+    BLOCK_MODEL_FENCE_POS_Z,
+    BLOCK_MODEL_FENCE_Z,
+    BLOCK_MODEL_FENCE_NEG_X,
+    BLOCK_MODEL_FENCE_NEG_X_NEG_Z,
+    BLOCK_MODEL_FENCE_NEG_X_POS_Z,
+    BLOCK_MODEL_FENCE_NEG_X_Z,
+    BLOCK_MODEL_FENCE_POS_X,
+    BLOCK_MODEL_FENCE_POS_X_NEG_Z,
+    BLOCK_MODEL_FENCE_POS_X_POS_Z,
+    BLOCK_MODEL_FENCE_POS_X_Z,
+    BLOCK_MODEL_FENCE_X,
+    BLOCK_MODEL_FENCE_X_NEG_Z,
+    BLOCK_MODEL_FENCE_X_POS_Z,
+    BLOCK_MODEL_FENCE_X_Z,
+    // 4 options
+    BLOCK_MODEL_BED_FOOT_POS_X,
+    BLOCK_MODEL_BED_FOOT_POS_Z,
+    BLOCK_MODEL_BED_FOOT_NEG_X,
+    BLOCK_MODEL_BED_FOOT_NEG_Z,
+    BLOCK_MODEL_LECTERN,
+    BLOCK_MODEL_TOP_SLAB,
+    BLOCK_MODEL_LILY_PAD,
 };
+
+typedef struct {
+    // bit flags indexed by direction of full faces
+    unsigned char full_face_flags;
+    // bit flags for pole supporting faces
+    unsigned char pole_face_flags;
+    // bit flags for faces that are non-empty as 1x1x1 cube
+    unsigned char non_empty_face_flags;
+} support_model;
 
 enum block_property {
     BLOCK_PROPERTY_ATTACHED,
@@ -1226,14 +1399,14 @@ enum block_property {
     BLOCK_PROPERTY_JIGSAW_ORIENTATION,
     BLOCK_PROPERTY_ATTACH_FACE,
     BLOCK_PROPERTY_BELL_ATTACHMENT,
-    BLOCK_PROPERTY_EAST_WALL,
-    BLOCK_PROPERTY_NORTH_WALL,
-    BLOCK_PROPERTY_SOUTH_WALL,
-    BLOCK_PROPERTY_WEST_WALL,
-    BLOCK_PROPERTY_EAST_REDSTONE,
-    BLOCK_PROPERTY_NORTH_REDSTONE,
-    BLOCK_PROPERTY_SOUTH_REDSTONE,
-    BLOCK_PROPERTY_WEST_REDSTONE,
+    BLOCK_PROPERTY_WALL_POS_X,
+    BLOCK_PROPERTY_WALL_NEG_Z,
+    BLOCK_PROPERTY_WALL_POS_Z,
+    BLOCK_PROPERTY_WALL_NEG_X,
+    BLOCK_PROPERTY_REDSTONE_POS_X,
+    BLOCK_PROPERTY_REDSTONE_NEG_Z,
+    BLOCK_PROPERTY_REDSTONE_POS_Z,
+    BLOCK_PROPERTY_REDSTONE_NEG_X,
     BLOCK_PROPERTY_DOUBLE_BLOCK_HALF,
     BLOCK_PROPERTY_HALF,
     BLOCK_PROPERTY_RAIL_SHAPE,
@@ -1253,7 +1426,6 @@ enum block_property {
     BLOCK_PROPERTY_LAYERS,
     BLOCK_PROPERTY_LEVEL_CAULDRON,
     BLOCK_PROPERTY_LEVEL_COMPOSTER,
-    BLOCK_PROPERTY_LEVEL_FLOWING,
     BLOCK_PROPERTY_LEVEL_HONEY,
     BLOCK_PROPERTY_LEVEL,
     BLOCK_PROPERTY_MOISTURE,
@@ -1341,14 +1513,14 @@ typedef struct {
             mc_ubyte jigsaw_orientation;
             mc_ubyte attach_face;
             mc_ubyte bell_attachment;
-            mc_ubyte east_wall;
-            mc_ubyte north_wall;
-            mc_ubyte south_wall;
-            mc_ubyte west_wall;
-            mc_ubyte east_redstone;
-            mc_ubyte north_redstone;
-            mc_ubyte south_redstone;
-            mc_ubyte west_redstone;
+            mc_ubyte wall_pos_x;
+            mc_ubyte wall_neg_z;
+            mc_ubyte wall_pos_z;
+            mc_ubyte wall_neg_x;
+            mc_ubyte redstone_pos_x;
+            mc_ubyte redstone_neg_z;
+            mc_ubyte redstone_pos_z;
+            mc_ubyte redstone_neg_x;
             mc_ubyte double_block_half;
             mc_ubyte half;
             mc_ubyte rail_shape;
@@ -1368,7 +1540,6 @@ typedef struct {
             mc_ubyte layers;
             mc_ubyte level_cauldron;
             mc_ubyte level_composter;
-            mc_ubyte level_flowing;
             mc_ubyte level_honey;
             mc_ubyte level;
             mc_ubyte moisture;
@@ -2380,6 +2551,74 @@ typedef struct {
     mc_ubyte size;
 } item_stack;
 
+// @TODO(traks) the names are not completely accurate, should improve names once
+// we figure out all the actual vanilla uses and start using them ourselves
+enum level_event_type {
+    LEVEL_EVENT_DISPENSER_DISPENSE_SOUND = 1000,
+    LEVEL_EVENT_DISPENSER_FAIL_SOUND,
+    LEVEL_EVENT_DISPENSER_LAUNCH_SOUND,
+    LEVEL_EVENT_ENDER_EYE_LAUNCH_SOUND,
+    LEVEL_EVENT_FIREWORK_ROCKET_SHOOT_SOUND,
+    LEVEL_EVENT_OPEN_IRON_DOOR_SOUND,
+    LEVEL_EVENT_OPEN_WOODEN_DOOR_SOUND,
+    LEVEL_EVENT_OPEN_WOODEN_TRAPDOOR_SOUND,
+    LEVEL_EVENT_OPEN_FENCE_GATE_SOUND,
+    LEVEL_EVENT_EXTINGUISH_FIRE_SOUND,
+    LEVEL_EVENT_PLAY_RECORD,
+    LEVEL_EVENT_CLOSE_IRON_DOOR_SOUND,
+    LEVEL_EVENT_CLOSE_WOODEN_DOOR_SOUND,
+    LEVEL_EVENT_CLOSE_WOODEN_TRAPDOOR_SOUND,
+    LEVEL_EVENT_CLOSE_FENCE_GATE_SOUND,
+    LEVEL_EVENT_GHAST_WARN_SOUND,
+    LEVEL_EVENT_GHAST_SHOOT_SOUND,
+    LEVEL_EVENT_ENDER_DRAGON_SHOOT_SOUND,
+    LEVEL_EVENT_BLAZE_SHOOT_SOUND,
+    LEVEL_EVENT_ZOMBIE_ATTACK_WOODEN_DOOR_SOUND,
+    LEVEL_EVENT_ZOMBIE_ATTACK_IRON_DOOR_SOUND,
+    LEVEL_EVENT_ZOMBIE_BREAK_WOODEN_DOOR_SOUND,
+    LEVEL_EVENT_WITHER_BREAK_BLOCK_SOUND,
+    LEVEL_EVENT_WITHER_SPAWN_SOUND,
+    LEVEL_EVENT_WITHER_SHOOT_SOUND,
+    LEVEL_EVENT_BAT_TAKEOFF_SOUND,
+    LEVEL_EVENT_ZOMBIE_INFECT_SOUND,
+    LEVEL_EVENT_ZOMBIE_VILLAGER_CONVERTED_SOUND,
+    LEVEL_EVENT_ENDER_DRAGON_DEATH_SOUND,
+    LEVEL_EVENT_ANVIL_DESTROY_SOUND,
+    LEVEL_EVENT_ANVIL_USE_SOUND,
+    LEVEL_EVENT_ANVIL_LAND_SOUND,
+    LEVEL_EVENT_PORTAL_TRAVEL_SOUND,
+    LEVEL_EVENT_CHORUS_FLOWER_GROW_SOUND,
+    LEVEL_EVENT_CHORUS_FLOWER_DEATH_SOUND,
+    LEVEL_EVENT_BREWING_STAND_BREW_SOUND,
+    LEVEL_EVENT_CLOSE_IRON_TRAPDOOR_SOUND,
+    LEVEL_EVENT_OPEN_IRON_TRAPDOOR_SOUND,
+    LEVEL_EVENT_END_PORTAL_SPAWN_SOUND,
+    LEVEL_EVENT_PHANTOM_BITE_SOUND,
+    LEVEL_EVENT_ZOMBIE_TO_DROWNED_SOUND,
+    LEVEL_EVENT_HUSK_TO_ZOMBIE_SOUND,
+    LEVEL_EVENT_GRINDSTONE_USE_SOUND,
+    LEVEL_EVENT_PAGE_TURNED_SOUND,
+    LEVEL_EVENT_SMITHING_TABLE_USE_SOUND,
+
+    LEVEL_EVENT_COMPOSTER_FILL = 1500,
+    LEVEL_EVENT_LAVA_EXTINGUISH,
+    LEVEL_EVENT_REDSTONE_TORCH_BURNOUT,
+    LEVEL_EVENT_END_PORTAL_FRAME_FILL,
+
+    LEVEL_EVENT_DISPENSER_DISPENSE_ANIMATION = 2000,
+    LEVEL_EVENT_BREAK_BLOCK_ANIMATION,
+    LEVEL_EVENT_THROWN_BOTTLE_HIT_ANIMATION,
+    LEVEL_EVENT_ENDER_EYE_DEATH_ANIMATION,
+    LEVEL_EVENT_GROWTH_ANIMATION,
+    LEVEL_EVENT_DRAGON_FIREBALL_HIT_ANIMATION,
+    LEVEL_EVENT_INSTANT_POTION_HIT_ANIMATION,
+    LEVEL_EVENT_ENDER_DRAGON_DESTROY_ANIMATION,
+    LEVEL_EVENT_SPONGE_EVAPORATE_ANIMATION,
+
+    LEVEL_EVENT_END_GATEWAY_SPAWN_ANIMATION = 3000,
+    LEVEL_EVENT_ENDER_DRAGON_GROWL_SOUND,
+};
+
 // in network id order
 enum entity_type {
     ENTITY_AREA_EFFECT_CLOUD,
@@ -2952,6 +3191,23 @@ typedef struct {
 } biome;
 
 typedef struct {
+    net_block_pos pos;
+    int from_direction;
+    mc_long for_tick;
+} scheduled_block_update;
+
+typedef struct {
+    net_block_pos pos;
+    unsigned char from_direction;
+} block_update;
+
+typedef struct {
+    block_update * blocks_to_update;
+    int update_count;
+    int max_updates;
+} block_update_context;
+
+typedef struct {
     mc_long current_tick;
 
     entity_base entities[MAX_ENTITIES];
@@ -2992,18 +3248,13 @@ typedef struct {
     resource_loc_table entity_resource_table;
     resource_loc_table fluid_resource_table;
 
-    block_properties block_properties_table[BLOCK_TYPE_COUNT];
-    int block_state_count;
+    block_properties block_properties_table[ACTUAL_BLOCK_TYPE_COUNT];
+    int vanilla_block_state_count;
+    int actual_block_state_count;
     block_property_spec block_property_specs[BLOCK_PROPERTY_COUNT];
     block_model block_models[128];
-    // @TODO(traks) a function should be used to access these. Some blocks
-    // require some computation to get their actual collision box depending on
-    // their coordinates in the world, such as bamboo. Another issue is that
-    // shulker box collision models depend on their tile entity state (opened or
-    // not) and not on their block state.
+    support_model support_models[128];
     mc_ubyte collision_model_by_state[18000];
-    // @TODO(traks) there should be a separate array for support models (some
-    // blocks use a different support model than collision model)
 
     dimension_type dimension_types[32];
     int dimension_type_count;
@@ -3013,7 +3264,19 @@ typedef struct {
 
     // block state -> block type
     mc_ushort block_type_by_state[18000];
+
+    // @TODO(traks) this is the simplest but dumbest thing. Should really store
+    // this per chunk, since we need to save it when chunk is unloaded. Limit
+    // should also be way higher.
+
+    // @TODO(traks) remove scheduled block updates when a block changes or the
+    // chunk gets unloaded? Not sure if it really matters if a block gets
+    // updated 'unexpectedly'. What is the worst thing that could happen?
+    scheduled_block_update scheduled_block_updates[100];
+    int scheduled_block_update_count;
 } server;
+
+extern server * serv;
 
 // in network order
 enum player_hand {
@@ -3062,6 +3325,12 @@ net_read_byte(buffer_cursor * cursor);
 
 void
 net_write_byte(buffer_cursor * cursor, mc_byte val);
+
+mc_long
+net_read_long(buffer_cursor * cursor);
+
+void
+net_write_long(buffer_cursor * cursor, mc_long val);
 
 mc_ushort
 net_read_ushort(buffer_cursor * cursor);
@@ -3151,6 +3420,15 @@ get_chunk_if_loaded(chunk_pos pos);
 chunk *
 get_chunk_if_available(chunk_pos pos);
 
+block_entity_base *
+try_get_block_entity(net_block_pos pos);
+
+mc_ushort
+try_get_block_state(net_block_pos pos);
+
+void
+try_set_block_state(net_block_pos pos, mc_ushort block_state);
+
 void
 chunk_set_block_state(chunk * ch, int x, int y, int z, mc_ushort block_state);
 
@@ -3159,7 +3437,7 @@ chunk_get_block_state(chunk * ch, int x, int y, int z);
 
 void
 try_read_chunk_from_storage(chunk_pos pos, chunk * ch,
-        memory_arena * scratch_arena, server * serv);
+        memory_arena * scratch_arena);
 
 chunk_section *
 alloc_chunk_section(void);
@@ -3171,13 +3449,13 @@ void
 clean_up_unused_chunks(void);
 
 entity_base *
-resolve_entity(server * serv, entity_id eid);
+resolve_entity(entity_id eid);
 
 entity_base *
-try_reserve_entity(server * serv, unsigned type);
+try_reserve_entity(unsigned type);
 
 void
-evict_entity(server * serv, entity_id eid);
+evict_entity(entity_id eid);
 
 void
 teleport_player(entity_base * entity,
@@ -3188,12 +3466,10 @@ void
 set_player_gamemode(entity_base * player, int new_gamemode);
 
 void
-tick_player(entity_base * entity, server * serv,
-        memory_arena * tick_arena);
+tick_player(entity_base * entity, memory_arena * tick_arena);
 
 void
-send_packets_to_player(entity_base * entity, server * serv,
-        memory_arena * tick_arena);
+send_packets_to_player(entity_base * entity, memory_arena * tick_arena);
 
 void
 register_resource_loc(net_string resource_loc, mc_short id,
@@ -3209,23 +3485,34 @@ int
 net_string_equal(net_string a, net_string b);
 
 void
-process_use_item_on_packet(server * serv, entity_base * player,
+process_use_item_on_packet(entity_base * player,
         mc_int hand, net_block_pos clicked_pos, mc_int clicked_face,
         float click_offset_x, float click_offset_y, float click_offset_z,
         mc_ubyte is_inside, memory_arena * scratch_arena);
+
+int
+use_block(entity_base * player,
+        mc_int hand, net_block_pos clicked_pos, mc_int clicked_face,
+        float click_offset_x, float click_offset_y, float click_offset_z,
+        mc_ubyte is_inside, block_update_context * buc);
 
 mc_ubyte
 get_max_stack_size(mc_int item_type);
 
 void
-propagate_block_updates_after_change(net_block_pos change_pos,
-        server * serv, memory_arena * scratch_arena);
+propagate_delayed_block_updates(memory_arena * scratch_arena);
+
+void
+propagate_block_updates(block_update_context * buc);
 
 net_block_pos
 get_relative_block_pos(net_block_pos pos, int face);
 
 int
 can_plant_survive_on(mc_int type_below);
+
+int
+can_lily_pad_survive_on(mc_ushort state_below);
 
 int
 can_carpet_survive_on(mc_int type_below);
@@ -3240,24 +3527,92 @@ int
 can_nether_plant_survive_on(mc_int type_below);
 
 int
+is_bamboo_plantable_on(mc_int type_below);
+
+int
+can_sea_pickle_survive_on(mc_ushort state_below);
+
+int
+can_snow_survive_on(mc_ushort state_below);
+
+int
+can_pressure_plate_survive_on(mc_ushort state_below);
+
+int
+can_redstone_wire_survive_on(mc_ushort state_below);
+
+int
+update_redstone_wire(net_block_pos pos, mc_ushort in_world_state,
+        block_state_info * base_info, block_update_context * buc);
+
+int
+can_sugar_cane_survive_at(net_block_pos cur_pos);
+
+int
 get_opposite_direction(int direction);
 
+int
+get_direction_axis(int direction);
+
 void
-init_block_data(server * serv);
+init_block_data(void);
+
+void
+init_item_data(void);
 
 int
 has_block_state_property(block_state_info * info, int prop);
 
 block_state_info
-describe_block_state(server * serv, mc_ushort block_state);
+describe_block_state(mc_ushort block_state);
 
 mc_ushort
-get_default_block_state(server * serv, mc_int block_type);
+get_default_block_state(mc_int block_type);
 
 block_state_info
-describe_default_block_state(server * serv, mc_int block_type);
+describe_default_block_state(mc_int block_type);
 
 mc_ushort
-make_block_state(server * serv, block_state_info * info);
+make_block_state(block_state_info * info);
+
+void
+update_stairs_shape(net_block_pos pos, block_state_info * cur_info);
+
+void
+update_pane_shape(net_block_pos pos,
+        block_state_info * cur_info, int from_direction);
+
+void
+update_fence_shape(net_block_pos pos,
+        block_state_info * cur_info, int from_direction);
+
+void
+update_wall_shape(net_block_pos pos,
+        block_state_info * cur_info, int from_direction);
+
+int
+get_player_facing(entity_base * player);
+
+int
+is_wall(mc_int block_type);
+
+block_model
+get_collision_model(mc_ushort block_state, net_block_pos pos);
+
+support_model
+get_support_model(mc_ushort block_state);
+
+int
+get_water_level(mc_ushort state);
+
+int
+is_water_source(mc_ushort state);
+
+int
+is_full_water(mc_ushort state);
+
+void
+push_direct_neighbour_block_updates(net_block_pos pos,
+        block_update_context * buc);
 
 #endif

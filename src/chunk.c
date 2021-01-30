@@ -6,6 +6,7 @@
 #include <zlib.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <string.h>
 #include "shared.h"
 
 // @TODO(traks) don't use a hash map. Performance depends on the chunks loaded,
@@ -124,6 +125,97 @@ hash_chunk_pos(chunk_pos pos) {
     return ((pos.x & 0x1f) << 5) | (pos.z & 0x1f);
 }
 
+block_entity_base *
+try_get_block_entity(net_block_pos pos) {
+    // @TODO(traks) return some special block entity instead of NULL?
+    if (pos.y < 0) {
+        return NULL;
+    }
+    if (pos.y > MAX_WORLD_Y) {
+        return NULL;
+    }
+
+    chunk_pos ch_pos = {
+        .x = pos.x >> 4,
+        .z = pos.z >> 4
+    };
+
+    chunk * ch = get_chunk_if_loaded(ch_pos);
+    if (ch == NULL) {
+        return NULL;
+    }
+
+    compact_chunk_block_pos chunk_block_pos = {
+        .x = pos.x & 0xf,
+        .y = pos.y,
+        .z = pos.z & 0xf,
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(ch->block_entities); i++) {
+        block_entity_base * block_entity = ch->block_entities + i;
+        if (!(block_entity->flags & BLOCK_ENTITY_IN_USE)) {
+            block_entity->pos = chunk_block_pos;
+            block_entity->type = BLOCK_ENTITY_NULL;
+            return block_entity;
+        } else if (memcmp(&block_entity->pos, &chunk_block_pos,
+                sizeof chunk_block_pos) == 0) {
+            return block_entity;
+        }
+    }
+    return NULL;
+}
+
+mc_ushort
+try_get_block_state(net_block_pos pos) {
+    if (pos.y < 0) {
+        return get_default_block_state(BLOCK_VOID_AIR);
+    }
+    if (pos.y > MAX_WORLD_Y) {
+        return get_default_block_state(BLOCK_AIR);
+    }
+
+    chunk_pos ch_pos = {
+        .x = pos.x >> 4,
+        .z = pos.z >> 4
+    };
+
+    chunk * ch = get_chunk_if_loaded(ch_pos);
+    if (ch == NULL) {
+        return get_default_block_state(BLOCK_UNKNOWN);
+    }
+
+    return chunk_get_block_state(ch, pos.x & 0xf, pos.y, pos.z & 0xf);
+}
+
+void
+try_set_block_state(net_block_pos pos, mc_ushort block_state) {
+    if (pos.y < 0) {
+        assert(0);
+        return;
+    }
+    if (pos.y > MAX_WORLD_Y) {
+        assert(0);
+        return;
+    }
+    if (block_state >= serv->vanilla_block_state_count) {
+        // catches unknown blocks
+        assert(0);
+        return;
+    }
+
+    chunk_pos ch_pos = {
+        .x = pos.x >> 4,
+        .z = pos.z >> 4
+    };
+
+    chunk * ch = get_chunk_if_loaded(ch_pos);
+    if (ch == NULL) {
+        return;
+    }
+
+    return chunk_set_block_state(ch, pos.x & 0xf, pos.y, pos.z & 0xf, block_state);
+}
+
 mc_ushort
 chunk_get_block_state(chunk * ch, int x, int y, int z) {
     assert(0 <= x && x < 16);
@@ -134,6 +226,9 @@ chunk_get_block_state(chunk * ch, int x, int y, int z) {
     chunk_section * section = ch->sections[section_y];
 
     if (section == NULL) {
+        // @TODO(traks) would it be possible to have a block type -> default state
+        // lookup here and have it expand to a constant once we pregenerate all
+        // the data tables?
         return 0;
     }
 
@@ -166,18 +261,32 @@ chunk_set_block_state(chunk * ch, int x, int y, int z, mc_ushort block_state) {
     // @TODO(traks) somehow ensure this never fails even with tons of players,
     // or make sure we appropriate handle cases in which too many changes occur
     // to a chunk per tick.
-    assert(ch->changed_block_count < ARRAY_SIZE(ch->changed_blocks));
 
-    compact_chunk_block_pos pos = {.x = x, .y = y, .z = z};
-    ch->changed_blocks[ch->changed_block_count] = pos;
-    ch->changed_block_count++;
+    // @TODO(traks) This is currently O(N^2) where N is the number of different
+    // blocks we changed in the chunk in a single tick. Should be faster.
+    int match = 0;
+    for (int i = 0; i < ch->changed_block_count; i++) {
+        compact_chunk_block_pos entry = ch->changed_blocks[i];
+        if (entry.x == x && entry.y == y && entry.z == z) {
+            match = 1;
+            break;
+        }
+    }
+
+    if (!match) {
+        assert(ch->changed_block_count < ARRAY_SIZE(ch->changed_blocks));
+
+        compact_chunk_block_pos pos = {.x = x, .y = y, .z = z};
+        ch->changed_blocks[ch->changed_block_count] = pos;
+        ch->changed_block_count++;
+    }
 
     int section_y = y >> 4;
     chunk_section * section = ch->sections[section_y];
 
     if (section == NULL) {
         // @TODO(traks) instead of making block setting fallible, perhaps
-        // getting the chunk should be if chunk sections cannot be allocated
+        // getting the chunk should fail if chunk sections cannot be allocated
         section = alloc_chunk_section();
         if (section == NULL) {
             logs_errno("Failed to allocate section: %s");
@@ -284,7 +393,7 @@ fill_buffer_from_file(int fd, buffer_cursor * cursor) {
 
 void
 try_read_chunk_from_storage(chunk_pos pos, chunk * ch,
-        memory_arena * scratch_arena, server * serv) {
+        memory_arena * scratch_arena) {
     begin_timed_block("read chunk");
 
     // @TODO(traks) error handling and/or error messages for all failure cases
@@ -453,8 +562,9 @@ try_read_chunk_from_storage(chunk_pos pos, chunk * ch,
 
     nbt_move_to_key(NET_STRING("DataVersion"), chunk_nbt, &cursor);
     mc_int data_version = net_read_int(&cursor);
-    if (data_version != 2578) {
-        logs("Unknown data version %jd", (intmax_t) data_version);
+    if (data_version != SERVER_WORLD_VERSION) {
+        logs("Data version %jd != %jd", (intmax_t) data_version,
+                (intmax_t) SERVER_WORLD_VERSION);
         goto bail;
     }
 
@@ -702,6 +812,7 @@ clean_up_unused_chunks(void) {
         for (int chunki = 0; chunki < bucket->size; chunki++) {
             chunk * ch = bucket->chunks + chunki;
             ch->changed_block_count = 0;
+            ch->local_event_count = 0;
 
             if (ch->available_interest == 0) {
                 for (int sectioni = 0; sectioni < 16; sectioni++) {

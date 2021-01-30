@@ -25,6 +25,8 @@
 static int server_sock;
 static volatile sig_atomic_t got_sigint;
 
+server * serv;
+
 #define INITIAL_CONNECTION_IN_USE ((unsigned) (1 << 0))
 
 enum initial_protocol_state {
@@ -241,6 +243,20 @@ get_opposite_direction(int direction) {
     }
 }
 
+int
+get_direction_axis(int direction) {
+    switch (direction) {
+    case DIRECTION_NEG_Y: return AXIS_Y;
+    case DIRECTION_POS_Y: return AXIS_Y;
+    case DIRECTION_NEG_Z: return AXIS_Z;
+    case DIRECTION_POS_Z: return AXIS_Z;
+    case DIRECTION_NEG_X: return AXIS_X;
+    case DIRECTION_POS_X: return AXIS_X;
+    default:
+        assert(0);
+    }
+}
+
 static mc_ushort
 hash_resource_loc(net_string resource_loc, resource_loc_table * table) {
     mc_ushort res = 0;
@@ -349,7 +365,7 @@ find_property_value_index(block_property_spec * prop_spec, net_string val) {
 }
 
 entity_base *
-resolve_entity(server * serv, entity_id eid) {
+resolve_entity(entity_id eid) {
     mc_uint index = eid & ENTITY_INDEX_MASK;
     entity_base * entity = serv->entities + index;
     if (entity->eid != eid || !(entity->flags & ENTITY_IN_USE)) {
@@ -360,7 +376,7 @@ resolve_entity(server * serv, entity_id eid) {
 }
 
 entity_base *
-try_reserve_entity(server * serv, unsigned type) {
+try_reserve_entity(unsigned type) {
     for (uint32_t i = 0; i < MAX_ENTITIES; i++) {
         entity_base * entity = serv->entities + i;
         if (!(entity->flags & ENTITY_IN_USE)) {
@@ -389,8 +405,8 @@ try_reserve_entity(server * serv, unsigned type) {
 }
 
 void
-evict_entity(server * serv, entity_id eid) {
-    entity_base * entity = resolve_entity(serv, eid);
+evict_entity(entity_id eid) {
+    entity_base * entity = resolve_entity(eid);
     if (entity->type != ENTITY_NULL) {
         entity->flags &= ~ENTITY_IN_USE;
         serv->entity_count--;
@@ -398,7 +414,18 @@ evict_entity(server * serv, entity_id eid) {
 }
 
 static void
-move_entity(entity_base * entity, server * serv) {
+move_entity(entity_base * entity) {
+    // @TODO(traks) Currently our collision system seems to be very different
+    // from Minecraft's collision system, which causes client-server desyncs
+    // when dropping item entities, etc. There are currently also uses with
+    // items following through the ground and then popping back up on the
+    // client's side.
+
+    // @TODO(traks) when you drop an item from high in the air, it often
+    // teleports slightly up after falling for a little while. From what I
+    // recall, vanilla was sometimes doing two item entity movements in one
+    // tick. What's really going on?
+
     double x = entity->x;
     double y = entity->y;
     double z = entity->z;
@@ -439,6 +466,16 @@ move_entity(entity_base * entity, server * serv) {
         min_z -= width / 2;
         max_z += width / 2;
 
+        // extend collision testing by 1 block, because the collision boxes of
+        // some blocks extend past a 1x1x1 volume. Examples are: fences and
+        // shulker boxes.
+        min_x -= 1;
+        min_y -= 1;
+        min_z -= 1;
+        max_x += 1;
+        max_y += 1;
+        max_z += 1;
+
         mc_int iter_min_x = floor(min_x);
         mc_int iter_max_x = floor(max_x);
         mc_int iter_min_y = floor(min_y);
@@ -454,28 +491,12 @@ move_entity(entity_base * entity, server * serv) {
         for (int block_x = iter_min_x; block_x <= iter_max_x; block_x++) {
             for (int block_y = iter_min_y; block_y <= iter_max_y; block_y++) {
                 for (int block_z = iter_min_z; block_z <= iter_max_z; block_z++) {
-                    chunk_pos ch_pos = {
-                        .x = block_x >> 4,
-                        .z = block_z >> 4,
-                    };
-                    chunk * ch = get_chunk_if_loaded(ch_pos);
-                    if (ch == NULL) {
-                        // @TODO(traks) what now?
-                        return;
-                    }
+                    net_block_pos block_pos = {.x = block_x, .y = block_y, .z = block_z};
+                    mc_ushort cur_state = try_get_block_state(block_pos);
+                    block_model model = get_collision_model(cur_state, block_pos);
 
-                    // @TODO(traks) can fail if y out of bounds
-                    mc_ushort cur_state = chunk_get_block_state(ch,
-                            block_x & 0xf, block_y, block_z & 0xf);
-
-                    if (cur_state == 0) {
-                        continue;
-                    }
-
-                    block_model * model = serv->block_models + serv->collision_model_by_state[cur_state];
-
-                    for (int boxi = 0; boxi < model->box_count; boxi++) {
-                        block_box * box = model->boxes + boxi;
+                    for (int boxi = 0; boxi < model.box_count; boxi++) {
+                        block_box * box = model.boxes + boxi;
 
                         double test_min_x = block_x + box->min_x - width / 2;
                         double test_max_x = block_x + box->max_x + width / 2;
@@ -613,18 +634,18 @@ move_entity(entity_base * entity, server * serv) {
 }
 
 static void
-tick_entity(entity_base * entity, server * serv, memory_arena * tick_arena) {
+tick_entity(entity_base * entity, memory_arena * tick_arena) {
     // @TODO(traks) currently it's possible that an entity is spawned and ticked
     // the same tick. Is that an issue or not? Maybe that causes undesirable
     // off-by-one tick behaviour.
 
     switch (entity->type) {
     case ENTITY_PLAYER:
-        tick_player(entity, serv, tick_arena);
+        tick_player(entity, tick_arena);
         break;
     case ENTITY_ITEM: {
         if (entity->item.contents.type == ITEM_AIR) {
-            evict_entity(serv, entity->eid);
+            evict_entity(entity->eid);
             return;
         }
 
@@ -636,42 +657,34 @@ tick_entity(entity_base * entity, server * serv, memory_arena * tick_arena) {
         // gravity acceleration
         entity->vy -= 0.04;
 
-        move_entity(entity, serv);
+        move_entity(entity);
 
         float drag = 0.98;
 
         if (entity->flags & ENTITY_ON_GROUND) {
             // Bit weird, but this is how MC works. Allows items to slide on
             // slabs if ice is below it.
-            mc_int ground_x = floor(entity->x);
-            mc_int ground_y = floor(entity->y - 0.99);
-            mc_int ground_z = floor(entity->z);
-
-            chunk_pos ch_pos = {
-                .x = ground_x >> 4,
-                .z = ground_z >> 4
+            net_block_pos ground = {
+                .x = floor(entity->x),
+                .y = floor(entity->y - 0.99),
+                .z = floor(entity->z),
             };
 
-            chunk * ch = get_chunk_if_loaded(ch_pos);
-            if (ch != NULL) {
-                // @TODO(traks) make sure this works if Y is out of bounds
-                mc_ushort ground_state = chunk_get_block_state(ch,
-                        ground_x & 0xf, ground_y, ground_z & 0xf);
-                mc_int ground_type = serv->block_type_by_state[ground_state];
+            mc_ushort ground_state = try_get_block_state(ground);
+            mc_int ground_type = serv->block_type_by_state[ground_state];
 
-                // Minecraft block friction
-                float friction;
-                switch (ground_type) {
-                case BLOCK_ICE: friction = 0.98f; break;
-                case BLOCK_SLIME_BLOCK: friction = 0.8f; break;
-                case BLOCK_PACKED_ICE: friction = 0.98f; break;
-                case BLOCK_FROSTED_ICE: friction = 0.98f; break;
-                case BLOCK_BLUE_ICE: friction = 0.989f; break;
-                default: friction = 0.6f; break;
-                }
-
-                drag *= friction;
+            // Minecraft block friction
+            float friction;
+            switch (ground_type) {
+            case BLOCK_ICE: friction = 0.98f; break;
+            case BLOCK_SLIME_BLOCK: friction = 0.8f; break;
+            case BLOCK_PACKED_ICE: friction = 0.98f; break;
+            case BLOCK_FROSTED_ICE: friction = 0.98f; break;
+            case BLOCK_BLUE_ICE: friction = 0.989f; break;
+            default: friction = 0.6f; break;
             }
+
+            drag *= friction;
         }
 
         entity->vx *= drag;
@@ -687,7 +700,7 @@ tick_entity(entity_base * entity, server * serv, memory_arena * tick_arena) {
 }
 
 static void
-server_tick(server * serv) {
+server_tick(void) {
     begin_timed_block("server tick");
 
     // accept new connections
@@ -812,7 +825,14 @@ server_tick(server * serv) {
                     if (next_state == 1) {
                         init_con->protocol_state = PROTOCOL_AWAIT_STATUS_REQUEST;
                     } else if (next_state == 2) {
-                        init_con->protocol_state = PROTOCOL_AWAIT_HELLO;
+                        if (protocol_version != SERVER_PROTOCOL_VERSION) {
+                            logs("Client protocol version %jd != %jd",
+                                    (intmax_t) protocol_version,
+                                    (intmax_t) SERVER_PROTOCOL_VERSION);
+                            rec_cursor.error = 1;
+                        } else {
+                            init_con->protocol_state = PROTOCOL_AWAIT_HELLO;
+                        }
                     } else {
                         rec_cursor.error = 1;
                     }
@@ -843,7 +863,7 @@ server_tick(server * serv) {
                     response_size += sprintf((char *) response + response_size,
                             "{\"version\":{\"name\":\"%s\",\"protocol\":%d},"
                             "\"players\":{\"max\":%d,\"online\":%d,\"sample\":[",
-                            "1.16.2", 751,
+                            "1.16.4, 1.16.5", SERVER_PROTOCOL_VERSION,
                             (int) MAX_PLAYERS, (int) list_size);
 
                     for (int i = 0; i < sample_size; i++) {
@@ -855,7 +875,11 @@ server_tick(server * serv) {
                             response_size += 1;
                         }
 
-                        entity_base * entity = resolve_entity(serv, *sampled);
+                        entity_base * entity = resolve_entity(*sampled);
+                        // @TODO(traks) this assert fired, not sure how that
+                        // happened. Can leave it for now, since these things
+                        // will may need to be rewritten anyway if we decide to
+                        // move all initial session stuff to a separate thread.
                         assert(entity->type == ENTITY_PLAYER);
                         // @TODO(traks) actual UUID
                         response_size += sprintf((char *) response + response_size,
@@ -978,7 +1002,7 @@ server_tick(server * serv) {
                 init_con->flags = 0;
                 initial_connection_count--;
 
-                entity_base * entity = try_reserve_entity(serv, ENTITY_PLAYER);
+                entity_base * entity = try_reserve_entity(ENTITY_PLAYER);
 
                 if (entity->type == ENTITY_NULL) {
                     // @TODO(traks) send some message and disconnect
@@ -993,17 +1017,17 @@ server_tick(server * serv) {
                 // to some website, Fortnite sends about 1.5KB/tick. Although we
                 // sometimes have to send a bunch of chunk data, which can be
                 // tens of KB. Minecraft even allows up to 2MB of chunk data.
-                player->rec_buf_size = 65536;
+                player->rec_buf_size = 1 << 16;
                 player->rec_buf = malloc(player->rec_buf_size);
 
-                player->send_buf_size = 1048576;
+                player->send_buf_size = 1 << 20;
                 player->send_buf = malloc(player->send_buf_size);
 
                 if (player->rec_buf == NULL || player->send_buf == NULL) {
                     // @TODO(traks) send some message on disconnect
                     free(player->send_buf);
                     free(player->rec_buf);
-                    evict_entity(serv, entity->eid);
+                    evict_entity(entity->eid);
                     close(init_con->sock);
                     continue;
                 }
@@ -1040,6 +1064,17 @@ server_tick(server * serv) {
 
     end_timed_block();
 
+    // run scheduled block updates
+    begin_timed_block("scheduled updates");
+
+    memory_arena scheduled_update_arena = {
+        .ptr = serv->short_lived_scratch,
+        .size = serv->short_lived_scratch_size
+    };
+    propagate_delayed_block_updates(&scheduled_update_arena);
+
+    end_timed_block();
+
     // update entities
     begin_timed_block("tick entities");
 
@@ -1054,7 +1089,7 @@ server_tick(server * serv) {
             .size = serv->short_lived_scratch_size
         };
 
-        tick_entity(entity, serv, &tick_arena);
+        tick_entity(entity, &tick_arena);
     }
 
     end_timed_block();
@@ -1064,7 +1099,7 @@ server_tick(server * serv) {
     // remove players from tab list if necessary
     for (int i = 0; i < serv->tab_list_size; i++) {
         entity_id eid = serv->tab_list[i];
-        entity_base * entity = resolve_entity(serv, eid);
+        entity_base * entity = resolve_entity(eid);
         if (entity->type == ENTITY_NULL) {
             // @TODO(traks) make sure this can never happen instead of hoping
             assert(serv->tab_list_removed_count < ARRAY_SIZE(serv->tab_list_removed));
@@ -1104,7 +1139,7 @@ server_tick(server * serv) {
             .ptr = serv->short_lived_scratch,
             .size = serv->short_lived_scratch_size
         };
-        send_packets_to_player(entity, serv, &tick_arena);
+        send_packets_to_player(entity, &tick_arena);
     }
 
     end_timed_block();
@@ -1151,7 +1186,7 @@ server_tick(server * serv) {
             .ptr = serv->short_lived_scratch,
             .size = serv->short_lived_scratch_size
         };
-        try_read_chunk_from_storage(pos, ch, &scratch_arena, serv);
+        try_read_chunk_from_storage(pos, ch, &scratch_arena);
 
         if (!(ch->flags & CHUNK_LOADED)) {
             // @TODO(traks) fall back to stone plateau at y = 0 for now
@@ -1275,91 +1310,153 @@ read_file(memory_arena * arena, char * file_name) {
 }
 
 static void
-load_item_types(server * serv) {
-    memory_arena arena = {
-        .ptr = serv->short_lived_scratch,
-        .size = serv->short_lived_scratch_size,
+register_entity_type(mc_int entity_type, char * resource_loc) {
+    net_string key = {
+        .size = strlen(resource_loc),
+        .ptr = resource_loc
     };
-    buffer_cursor cursor = read_file(&arena, "itemtypes.txt");
-
-    net_string args[16];
-    mc_ushort id = 0;
-
-    for (;;) {
-        int arg_count = parse_database_line(&cursor, args);
-        if (arg_count == 0) {
-            // empty line
-            if (cursor.index == cursor.limit) {
-                break;
-            }
-        } else if (net_string_equal(args[0], NET_STRING("key"))) {
-            register_resource_loc(args[1], id, &serv->item_resource_table);
-            id++;
-        }
-    }
-
-    assert(id == serv->item_resource_table.max_ids);
+    resource_loc_table * table = &serv->entity_resource_table;
+    register_resource_loc(key, entity_type, table);
+    assert(net_string_equal(key, get_resource_loc(entity_type, table)));
+    assert(entity_type == resolve_resource_loc_id(key, table));
 }
 
 static void
-load_entity_types(server * serv) {
-    memory_arena arena = {
-        .ptr = serv->short_lived_scratch,
-        .size = serv->short_lived_scratch_size,
-    };
-    buffer_cursor cursor = read_file(&arena, "entitytypes.txt");
-
-    net_string args[16];
-    mc_ushort entity_types = 0;
-
-    for (;;) {
-        int arg_count = parse_database_line(&cursor, args);
-        if (arg_count == 0) {
-            // empty line
-            if (cursor.index == cursor.limit) {
-                break;
-            }
-        } else if (net_string_equal(args[0], NET_STRING("key"))) {
-            mc_ushort id = entity_types;
-            entity_types++;
-            register_resource_loc(args[1], id, &serv->entity_resource_table);
-        }
-    }
-
-    assert(entity_types == serv->entity_resource_table.max_ids);
+init_entity_data(void) {
+    register_entity_type(ENTITY_AREA_EFFECT_CLOUD, "minecraft:area_effect_cloud");
+    register_entity_type(ENTITY_ARMOR_STAND, "minecraft:armor_stand");
+    register_entity_type(ENTITY_ARROW, "minecraft:arrow");
+    register_entity_type(ENTITY_BAT, "minecraft:bat");
+    register_entity_type(ENTITY_BEE, "minecraft:bee");
+    register_entity_type(ENTITY_BLAZE, "minecraft:blaze");
+    register_entity_type(ENTITY_BOAT, "minecraft:boat");
+    register_entity_type(ENTITY_CAT, "minecraft:cat");
+    register_entity_type(ENTITY_CAVE_SPIDER, "minecraft:cave_spider");
+    register_entity_type(ENTITY_CHICKEN, "minecraft:chicken");
+    register_entity_type(ENTITY_COD, "minecraft:cod");
+    register_entity_type(ENTITY_COW, "minecraft:cow");
+    register_entity_type(ENTITY_CREEPER, "minecraft:creeper");
+    register_entity_type(ENTITY_DOLPHIN, "minecraft:dolphin");
+    register_entity_type(ENTITY_DONKEY, "minecraft:donkey");
+    register_entity_type(ENTITY_DRAGON_FIREBALL, "minecraft:dragon_fireball");
+    register_entity_type(ENTITY_DROWNED, "minecraft:drowned");
+    register_entity_type(ENTITY_ELDER_GUARDIAN, "minecraft:elder_guardian");
+    register_entity_type(ENTITY_END_CRYSTAL, "minecraft:end_crystal");
+    register_entity_type(ENTITY_ENDER_DRAGON, "minecraft:ender_dragon");
+    register_entity_type(ENTITY_ENDERMAN, "minecraft:enderman");
+    register_entity_type(ENTITY_ENDERMITE, "minecraft:endermite");
+    register_entity_type(ENTITY_EVOKER, "minecraft:evoker");
+    register_entity_type(ENTITY_EVOKER_FANGS, "minecraft:evoker_fangs");
+    register_entity_type(ENTITY_EXPERIENCE_ORB, "minecraft:experience_orb");
+    register_entity_type(ENTITY_EYE_OF_ENDER, "minecraft:eye_of_ender");
+    register_entity_type(ENTITY_FALLING_BLOCK, "minecraft:falling_block");
+    register_entity_type(ENTITY_FIREWORK_ROCKET, "minecraft:firework_rocket");
+    register_entity_type(ENTITY_FOX, "minecraft:fox");
+    register_entity_type(ENTITY_GHAST, "minecraft:ghast");
+    register_entity_type(ENTITY_GIANT, "minecraft:giant");
+    register_entity_type(ENTITY_GUARDIAN, "minecraft:guardian");
+    register_entity_type(ENTITY_HOGLIN, "minecraft:hoglin");
+    register_entity_type(ENTITY_HORSE, "minecraft:horse");
+    register_entity_type(ENTITY_HUSK, "minecraft:husk");
+    register_entity_type(ENTITY_ILLUSIONER, "minecraft:illusioner");
+    register_entity_type(ENTITY_IRON_GOLEM, "minecraft:iron_golem");
+    register_entity_type(ENTITY_ITEM, "minecraft:item");
+    register_entity_type(ENTITY_ITEM_FRAME, "minecraft:item_frame");
+    register_entity_type(ENTITY_FIREBALL, "minecraft:fireball");
+    register_entity_type(ENTITY_LEASH_KNOT, "minecraft:leash_knot");
+    register_entity_type(ENTITY_LIGHTNING_BOLT, "minecraft:lightning_bolt");
+    register_entity_type(ENTITY_LLAMA, "minecraft:llama");
+    register_entity_type(ENTITY_LLAMA_SPIT, "minecraft:llama_spit");
+    register_entity_type(ENTITY_MAGMA_CUBE, "minecraft:magma_cube");
+    register_entity_type(ENTITY_MINECART, "minecraft:minecart");
+    register_entity_type(ENTITY_CHEST_MINECART, "minecraft:chest_minecart");
+    register_entity_type(ENTITY_COMMAND_BLOCK_MINECART, "minecraft:command_block_minecart");
+    register_entity_type(ENTITY_FURNACE_MINECART, "minecraft:furnace_minecart");
+    register_entity_type(ENTITY_HOPPER_MINECART, "minecraft:hopper_minecart");
+    register_entity_type(ENTITY_SPAWNER_MINECART, "minecraft:spawner_minecart");
+    register_entity_type(ENTITY_TNT_MINECART, "minecraft:tnt_minecart");
+    register_entity_type(ENTITY_MULE, "minecraft:mule");
+    register_entity_type(ENTITY_MOOSHROOM, "minecraft:mooshroom");
+    register_entity_type(ENTITY_OCELOT, "minecraft:ocelot");
+    register_entity_type(ENTITY_PAINTING, "minecraft:painting");
+    register_entity_type(ENTITY_PANDA, "minecraft:panda");
+    register_entity_type(ENTITY_PARROT, "minecraft:parrot");
+    register_entity_type(ENTITY_PHANTOM, "minecraft:phantom");
+    register_entity_type(ENTITY_PIG, "minecraft:pig");
+    register_entity_type(ENTITY_PIGLIN, "minecraft:piglin");
+    register_entity_type(ENTITY_PIGLIN_BRUTE, "minecraft:piglin_brute");
+    register_entity_type(ENTITY_PILLAGER, "minecraft:pillager");
+    register_entity_type(ENTITY_POLAR_BEAR, "minecraft:polar_bear");
+    register_entity_type(ENTITY_TNT, "minecraft:tnt");
+    register_entity_type(ENTITY_PUFFERFISH, "minecraft:pufferfish");
+    register_entity_type(ENTITY_RABBIT, "minecraft:rabbit");
+    register_entity_type(ENTITY_RAVAGER, "minecraft:ravager");
+    register_entity_type(ENTITY_SALMON, "minecraft:salmon");
+    register_entity_type(ENTITY_SHEEP, "minecraft:sheep");
+    register_entity_type(ENTITY_SHULKER, "minecraft:shulker");
+    register_entity_type(ENTITY_SHULKER_BULLET, "minecraft:shulker_bullet");
+    register_entity_type(ENTITY_SILVERFISH, "minecraft:silverfish");
+    register_entity_type(ENTITY_SKELETON, "minecraft:skeleton");
+    register_entity_type(ENTITY_SKELETON_HORSE, "minecraft:skeleton_horse");
+    register_entity_type(ENTITY_SLIME, "minecraft:slime");
+    register_entity_type(ENTITY_SMALL_FIREBALL, "minecraft:small_fireball");
+    register_entity_type(ENTITY_SNOW_GOLEM, "minecraft:snow_golem");
+    register_entity_type(ENTITY_SNOWBALL, "minecraft:snowball");
+    register_entity_type(ENTITY_SPECTRAL_ARROW, "minecraft:spectral_arrow");
+    register_entity_type(ENTITY_SPIDER, "minecraft:spider");
+    register_entity_type(ENTITY_SQUID, "minecraft:squid");
+    register_entity_type(ENTITY_STRAY, "minecraft:stray");
+    register_entity_type(ENTITY_STRIDER, "minecraft:strider");
+    register_entity_type(ENTITY_EGG, "minecraft:egg");
+    register_entity_type(ENTITY_ENDER_PEARL, "minecraft:ender_pearl");
+    register_entity_type(ENTITY_EXPERIENCE_BOTTLE, "minecraft:experience_bottle");
+    register_entity_type(ENTITY_POTION, "minecraft:potion");
+    register_entity_type(ENTITY_TRIDENT, "minecraft:trident");
+    register_entity_type(ENTITY_TRADER_LLAMA, "minecraft:trader_llama");
+    register_entity_type(ENTITY_TROPICAL_FISH, "minecraft:tropical_fish");
+    register_entity_type(ENTITY_TURTLE, "minecraft:turtle");
+    register_entity_type(ENTITY_VEX, "minecraft:vex");
+    register_entity_type(ENTITY_VILLAGER, "minecraft:villager");
+    register_entity_type(ENTITY_VINDICATOR, "minecraft:vindicator");
+    register_entity_type(ENTITY_WANDERING_TRADER, "minecraft:wandering_trader");
+    register_entity_type(ENTITY_WITCH, "minecraft:witch");
+    register_entity_type(ENTITY_WITHER, "minecraft:wither");
+    register_entity_type(ENTITY_WITHER_SKELETON, "minecraft:wither_skeleton");
+    register_entity_type(ENTITY_WITHER_SKULL, "minecraft:wither_skull");
+    register_entity_type(ENTITY_WOLF, "minecraft:wolf");
+    register_entity_type(ENTITY_ZOGLIN, "minecraft:zoglin");
+    register_entity_type(ENTITY_ZOMBIE, "minecraft:zombie");
+    register_entity_type(ENTITY_ZOMBIE_HORSE, "minecraft:zombie_horse");
+    register_entity_type(ENTITY_ZOMBIE_VILLAGER, "minecraft:zombie_villager");
+    register_entity_type(ENTITY_ZOMBIFIED_PIGLIN, "minecraft:zombified_piglin");
+    register_entity_type(ENTITY_PLAYER, "minecraft:player");
+    register_entity_type(ENTITY_FISHING_BOBBER, "minecraft:fishing_bobber");
+    register_entity_type(ENTITY_NULL, "blaze:null");
 }
 
 static void
-load_fluid_types(server * serv) {
-    memory_arena arena = {
-        .ptr = serv->short_lived_scratch,
-        .size = serv->short_lived_scratch_size,
+register_fluid_type(mc_int fluid_type, char * resource_loc) {
+    net_string key = {
+        .size = strlen(resource_loc),
+        .ptr = resource_loc
     };
-    buffer_cursor cursor = read_file(&arena, "fluidtypes.txt");
-
-    net_string args[16];
-    mc_ushort fluid_types = 0;
-
-    for (;;) {
-        int arg_count = parse_database_line(&cursor, args);
-        if (arg_count == 0) {
-            // empty line
-            if (cursor.index == cursor.limit) {
-                break;
-            }
-        } else if (net_string_equal(args[0], NET_STRING("key"))) {
-            mc_ushort id = fluid_types;
-            fluid_types++;
-            register_resource_loc(args[1], id, &serv->fluid_resource_table);
-        }
-    }
-
-    assert(fluid_types == serv->fluid_resource_table.max_ids);
+    resource_loc_table * table = &serv->fluid_resource_table;
+    register_resource_loc(key, fluid_type, table);
+    assert(net_string_equal(key, get_resource_loc(fluid_type, table)));
+    assert(fluid_type == resolve_resource_loc_id(key, table));
 }
 
 static void
-load_tags(char * file_name, tag_list * tags,
-        resource_loc_table * table, server * serv) {
+init_fluid_data(void) {
+    register_fluid_type(0, "minecraft:empty");
+    register_fluid_type(1, "minecraft:flowing_water");
+    register_fluid_type(2, "minecraft:water");
+    register_fluid_type(3, "minecraft:flowing_lava");
+    register_fluid_type(4, "minecraft:lava");
+}
+
+static void
+load_tags(char * file_name, tag_list * tags, resource_loc_table * table) {
     memory_arena arena = {
         .ptr = serv->short_lived_scratch,
         .size = serv->short_lived_scratch_size,
@@ -1411,7 +1508,7 @@ load_tags(char * file_name, tag_list * tags,
 }
 
 static void
-init_dimension_types(server * serv) {
+init_dimension_types(void) {
     dimension_type * overworld = serv->dimension_types + serv->dimension_type_count;
     serv->dimension_type_count++;
 
@@ -1441,7 +1538,7 @@ init_dimension_types(server * serv) {
 }
 
 static void
-init_biomes(server * serv) {
+init_biomes(void) {
     biome * ocean = serv->biomes + serv->biome_count;
     serv->biome_count++;
 
@@ -1564,7 +1661,7 @@ main(void) {
 
     logs("Bound to address");
 
-    server * serv = calloc(sizeof * serv, 1);
+    serv = calloc(sizeof * serv, 1);
     if (serv == NULL) {
         logs_errno("Failed to allocate server struct: %s");
         exit(1);
@@ -1583,29 +1680,29 @@ main(void) {
     }
 
     // @TODO(traks) better sizes
-    alloc_resource_loc_table(&serv->block_resource_table, 1 << 10, 1 << 16, BLOCK_TYPE_COUNT);
+    alloc_resource_loc_table(&serv->block_resource_table, 1 << 10, 1 << 16, ACTUAL_BLOCK_TYPE_COUNT);
     alloc_resource_loc_table(&serv->item_resource_table, 1 << 10, 1 << 16, ITEM_TYPE_COUNT);
     alloc_resource_loc_table(&serv->entity_resource_table, 1 << 10, 1 << 12, ENTITY_TYPE_COUNT);
     alloc_resource_loc_table(&serv->fluid_resource_table, 1 << 10, 1 << 10, 5);
 
-    load_item_types(serv);
-    init_block_data(serv);
-    load_entity_types(serv);
-    load_fluid_types(serv);
-    load_tags("blocktags.txt", &serv->block_tags, &serv->block_resource_table, serv);
-    load_tags("itemtags.txt", &serv->item_tags, &serv->item_resource_table, serv);
-    load_tags("entitytags.txt", &serv->entity_tags, &serv->entity_resource_table, serv);
-    load_tags("fluidtags.txt", &serv->fluid_tags, &serv->fluid_resource_table, serv);
+    init_item_data();
+    init_block_data();
+    init_entity_data();
+    init_fluid_data();
+    load_tags("blocktags.txt", &serv->block_tags, &serv->block_resource_table);
+    load_tags("itemtags.txt", &serv->item_tags, &serv->item_resource_table);
+    load_tags("entitytags.txt", &serv->entity_tags, &serv->entity_resource_table);
+    load_tags("fluidtags.txt", &serv->fluid_tags, &serv->fluid_resource_table);
 
-    init_dimension_types(serv);
-    init_biomes(serv);
+    init_dimension_types();
+    init_biomes();
 
     int profiler_sock = -1;
 
     for (;;) {
         long long start_time = program_nano_time();
 
-        server_tick(serv);
+        server_tick();
 
         if (profiler_sock == -1) {
             profiler_sock = socket(AF_INET, SOCK_STREAM, 0);

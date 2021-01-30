@@ -286,9 +286,8 @@ process_move_player_packet(entity_base * player,
 }
 
 static int
-drop_item(entity_base * player, item_stack * is,
-        unsigned char drop_size, server * serv) {
-    entity_base * item = try_reserve_entity(serv, ENTITY_ITEM);
+drop_item(entity_base * player, item_stack * is, unsigned char drop_size) {
+    entity_base * item = try_reserve_entity(ENTITY_ITEM);
     if (item->type == ENTITY_NULL) {
         return 0;
     }
@@ -321,7 +320,7 @@ drop_item(entity_base * player, item_stack * is,
 
 static void
 process_packet(entity_base * entity, buffer_cursor * rec_cursor,
-        server * serv, memory_arena * process_arena) {
+        memory_arena * process_arena) {
     // @NOTE(traks) we need to handle packets in the order in which they arive,
     // so e.g. the client can move the player to a position, perform some
     // action, and then move the player a bit further, all in the same tick.
@@ -522,7 +521,7 @@ process_packet(entity_base * entity, buffer_cursor * rec_cursor,
         }
 
         mc_ubyte signing = net_read_ubyte(rec_cursor);
-        mc_int hand = net_read_varint(rec_cursor);
+        mc_int slot = net_read_varint(rec_cursor);
         // @TODO(traks) handle the event
         break;
     }
@@ -707,11 +706,22 @@ process_packet(entity_base * entity, buffer_cursor * rec_cursor,
 
                 // @TODO(traks) better block breaking logic. E.g. new state
                 // should be water source block if waterlogged block is broken.
+                // Should move this stuff to some generic block breaking
+                // function, so we can do proper block updating of redstone dust
+                // and stuff.
+                int max_updates = 512;
+                block_update_context buc = {
+                    .blocks_to_update = alloc_in_arena(process_arena,
+                            max_updates * sizeof (block_update)),
+                    .update_count = 0,
+                    .max_updates = max_updates
+                };
+
                 mc_ushort new_state = 0;
                 chunk_set_block_state(ch, block_pos.x & 0xf, block_pos.y,
                         block_pos.z & 0xf, new_state);
-                propagate_block_updates_after_change(block_pos,
-                        serv, process_arena);
+                push_direct_neighbour_block_updates(block_pos, &buc);
+                propagate_block_updates(&buc);
 
                 // @TODO(traks) rewrite so we don't need an assert
                 assert(player->block_break_ack_count
@@ -744,7 +754,7 @@ process_packet(entity_base * entity, buffer_cursor * rec_cursor,
             // itself, so no need to send updates for the slot if nothing
             // special happens
             if (is->size > 0) {
-                if (drop_item(entity, is, is->size, serv)) {
+                if (drop_item(entity, is, is->size)) {
                     is->size = 0;
                     is->type = ITEM_AIR;
                 } else {
@@ -761,7 +771,7 @@ process_packet(entity_base * entity, buffer_cursor * rec_cursor,
             // itself, so no need to send updates for the slot if nothing
             // special happens
             if (is->size > 0) {
-                if (drop_item(entity, is, 1, serv)) {
+                if (drop_item(entity, is, 1)) {
                     is->size -= 1;
                     if (is->size == 0) {
                         is->type = ITEM_AIR;
@@ -1038,7 +1048,7 @@ process_packet(entity_base * entity, buffer_cursor * rec_cursor,
         // target position as well, so no assertions fire when setting the block
         // in the chunk (e.g. because of negative y)
 
-        process_use_item_on_packet(serv, entity, hand, clicked_pos,
+        process_use_item_on_packet(entity, hand, clicked_pos,
                 clicked_face, click_offset_x, click_offset_y, click_offset_z,
                 is_inside, process_arena);
         break;
@@ -1286,7 +1296,7 @@ send_light_update(buffer_cursor * send_cursor, chunk_pos pos, chunk * ch,
 }
 
 static void
-disconnect_player_now(entity_base * entity, server * serv) {
+disconnect_player_now(entity_base * entity) {
     entity_player * player = &entity->player;
     close(player->sock);
 
@@ -1307,7 +1317,7 @@ disconnect_player_now(entity_base * entity, server * serv) {
     free(player->rec_buf);
     free(player->send_buf);
 
-    evict_entity(serv, entity->eid);
+    evict_entity(entity->eid);
 }
 
 static float
@@ -1374,8 +1384,7 @@ add_stack_to_player_inventory(entity_base * player, item_stack * to_add) {
 }
 
 void
-tick_player(entity_base * player, server * serv,
-        memory_arena * tick_arena) {
+tick_player(entity_base * player, memory_arena * tick_arena) {
     begin_timed_block("tick player");
 
     assert(player->type == ENTITY_PLAYER);
@@ -1384,12 +1393,12 @@ tick_player(entity_base * player, server * serv,
             player->player.rec_buf_size - player->player.rec_cursor, 0);
 
     if (rec_size == 0) {
-        disconnect_player_now(player, serv);
+        disconnect_player_now(player);
     } else if (rec_size == -1) {
         // EAGAIN means no data received
         if (errno != EAGAIN) {
             logs_errno("Couldn't receive protocol data: %s");
-            disconnect_player_now(player, serv);
+            disconnect_player_now(player);
         }
     } else {
         player->player.rec_cursor += rec_size;
@@ -1410,7 +1419,7 @@ tick_player(entity_base * player, server * serv,
                 break;
             }
             if (packet_size > player->player.rec_buf_size - 5 || packet_size <= 0) {
-                disconnect_player_now(player, serv);
+                disconnect_player_now(player);
                 break;
             }
             if (packet_size > packet_cursor.limit - packet_cursor.index) {
@@ -1439,7 +1448,7 @@ tick_player(entity_base * player, server * serv,
 
                 if (inflateInit2(&zstream, 0) != Z_OK) {
                     logs("inflateInit failed");
-                    disconnect_player_now(player, serv);
+                    disconnect_player_now(player);
                     break;
                 }
 
@@ -1455,19 +1464,19 @@ tick_player(entity_base * player, server * serv,
 
                 if (inflate(&zstream, Z_FINISH) != Z_STREAM_END) {
                     logs("Failed to finish inflating packet: %s", zstream.msg);
-                    disconnect_player_now(player, serv);
+                    disconnect_player_now(player);
                     break;
                 }
 
                 if (inflateEnd(&zstream) != Z_OK) {
                     logs("inflateEnd failed");
-                    disconnect_player_now(player, serv);
+                    disconnect_player_now(player);
                     break;
                 }
 
                 if (zstream.avail_in != 0) {
                     logs("Didn't inflate entire packet");
-                    disconnect_player_now(player, serv);
+                    disconnect_player_now(player);
                     break;
                 }
 
@@ -1477,17 +1486,17 @@ tick_player(entity_base * player, server * serv,
                 };
             }
 
-            process_packet(player, &packet_cursor, serv, &process_arena);
+            process_packet(player, &packet_cursor, &process_arena);
 
             if (packet_cursor.error != 0) {
                 logs("Player protocol error occurred");
-                disconnect_player_now(player, serv);
+                disconnect_player_now(player);
                 break;
             }
 
             if (packet_cursor.index != packet_cursor.limit) {
                 logs("Player protocol packet not fully read");
-                disconnect_player_now(player, serv);
+                disconnect_player_now(player);
                 break;
             }
         }
@@ -1925,7 +1934,7 @@ send_take_item_entity_packet(entity_base * player, buffer_cursor * send_cursor,
 }
 
 static void
-try_update_tracked_entity(entity_base * player, server * serv,
+try_update_tracked_entity(entity_base * player,
         buffer_cursor * send_cursor, memory_arena * tick_arena,
         tracked_entity * tracked, entity_base * entity) {
     if (serv->current_tick - tracked->last_update_tick < tracked->update_interval
@@ -2059,7 +2068,7 @@ try_update_tracked_entity(entity_base * player, server * serv,
 }
 
 static void
-start_tracking_entity(entity_base * player, server * serv,
+start_tracking_entity(entity_base * player,
         buffer_cursor * send_cursor, memory_arena * tick_arena,
         tracked_entity * tracked, entity_base * entity) {
     *tracked = (tracked_entity) {0};
@@ -2182,8 +2191,7 @@ send_player_abilities(buffer_cursor * send_cursor, entity_base * player) {
 }
 
 void
-send_packets_to_player(entity_base * player, server * serv,
-        memory_arena * tick_arena) {
+send_packets_to_player(entity_base * player, memory_arena * tick_arena) {
     begin_timed_block("send packets");
 
     size_t max_uncompressed_packet_size = 1 << 20;
@@ -2435,17 +2443,11 @@ send_packets_to_player(entity_base * player, server * serv,
     // send block changes for this player only
     for (int i = 0; i < player->player.changed_block_count; i++) {
         net_block_pos pos = player->player.changed_blocks[i];
-        chunk_pos ch_pos = {
-            .x = pos.x >> 4,
-            .z = pos.z >> 4
-        };
-        chunk * ch = get_chunk_if_loaded(ch_pos);
-        if (ch == NULL) {
+        mc_ushort block_state = try_get_block_state(pos);
+        if (block_state >= serv->vanilla_block_state_count) {
+            // catches unknown blocks
             continue;
         }
-
-        mc_ushort block_state = chunk_get_block_state(ch,
-                pos.x & 0xf, pos.y, pos.z & 0xf);
 
         begin_packet(send_cursor, CBP_BLOCK_UPDATE);
         net_write_block_pos(send_cursor, pos);
@@ -2499,48 +2501,57 @@ send_packets_to_player(entity_base * player, server * serv,
 
                 chunk * ch = get_chunk_if_loaded(pos);
                 assert(ch != NULL);
-                if (ch->changed_block_count == 0) {
-                    continue;
+
+                if (ch->changed_block_count != 0) {
+                    for (int section = 0; section < 16; section++) {
+                        int changed_blocks_size = ARRAY_SIZE(ch->changed_blocks);
+                        compact_chunk_block_pos sec_changed_blocks[changed_blocks_size];
+                        int sec_changed_block_count = 0;
+
+                        for (int i = 0; i < ch->changed_block_count; i++) {
+                            compact_chunk_block_pos pos = ch->changed_blocks[i];
+                            if ((pos.y >> 4) == section) {
+                                sec_changed_blocks[sec_changed_block_count] = pos;
+                                sec_changed_block_count++;
+                            }
+                        }
+
+                        if (sec_changed_block_count == 0) {
+                            continue;
+                        }
+
+                        begin_packet(send_cursor, CBP_SECTION_BLOCKS_UPDATE);
+                        mc_ulong section_pos =
+                                ((mc_ulong) (x & 0x3fffff) << 42)
+                                | ((mc_ulong) (z & 0x3fffff) << 20)
+                                | (mc_ulong) (section & 0xfffff);
+                        net_write_ulong(send_cursor, section_pos);
+                        // @TODO(traks) appropriate value for this
+                        net_write_ubyte(send_cursor, 1); // suppress light updates
+                        net_write_varint(send_cursor, sec_changed_block_count);
+
+                        for (int i = 0; i < sec_changed_block_count; i++) {
+                            compact_chunk_block_pos pos = sec_changed_blocks[i];
+                            mc_long block_state = chunk_get_block_state(ch,
+                                    pos.x, pos.y, pos.z);
+                            mc_long encoded = (block_state << 12)
+                                    | (pos.x << 8) | (pos.z << 4) | (pos.y & 0xf);
+                            net_write_varlong(send_cursor, encoded);
+                        }
+                        finish_packet(send_cursor, player);
+                    }
                 }
 
-                for (int section = 0; section < 16; section++) {
-                    int changed_blocks_size = ARRAY_SIZE(ch->changed_blocks);
-                    compact_chunk_block_pos sec_changed_blocks[changed_blocks_size];
-                    int sec_changed_block_count = 0;
+                for (int i = 0; i < ch->local_event_count; i++) {
+                    level_event * event = ch->local_events + i;
 
-                    for (int i = 0; i < ch->changed_block_count; i++) {
-                        compact_chunk_block_pos pos = ch->changed_blocks[i];
-                        if ((pos.y >> 4) == section) {
-                            sec_changed_blocks[sec_changed_block_count] = pos;
-                            sec_changed_block_count++;
-                        }
-                    }
-
-                    if (sec_changed_block_count == 0) {
-                        continue;
-                    }
-
-                    begin_packet(send_cursor, CBP_SECTION_BLOCKS_UPDATE);
-                    mc_ulong section_pos =
-                            ((mc_ulong) (x & 0x3fffff) << 42)
-                            | ((mc_ulong) (z & 0x3fffff) << 20)
-                            | (mc_ulong) (section & 0xfffff);
-                    net_write_ulong(send_cursor, section_pos);
-                    // @TODO(traks) appropriate value for this
-                    net_write_ubyte(send_cursor, 1); // suppress light updates
-                    net_write_varint(send_cursor, sec_changed_block_count);
-
-                    for (int i = 0; i < sec_changed_block_count; i++) {
-                        compact_chunk_block_pos pos = sec_changed_blocks[i];
-                        mc_long block_state = chunk_get_block_state(ch,
-                                pos.x, pos.y, pos.z);
-                        mc_long encoded = (block_state << 12)
-                                | (pos.x << 8) | (pos.z << 4) | (pos.y & 0xf);
-                        net_write_varlong(send_cursor, encoded);
-                    }
+                    begin_packet(send_cursor, CBP_LEVEL_EVENT);
+                    net_write_int(send_cursor, event->type);
+                    net_write_block_pos(send_cursor, event->pos);
+                    net_write_int(send_cursor, event->data);
+                    net_write_ubyte(send_cursor, 0); // is global event
                     finish_packet(send_cursor, player);
                 }
-
                 continue;
             }
 
@@ -2686,7 +2697,7 @@ send_packets_to_player(entity_base * player, server * serv,
 
             for (int i = 0; i < serv->tab_list_size; i++) {
                 entity_id eid = serv->tab_list[i];
-                entity_base * player = resolve_entity(serv, eid);
+                entity_base * player = resolve_entity(eid);
                 assert(player->type == ENTITY_PLAYER);
                 // @TODO(traks) write UUID
                 net_write_ulong(send_cursor, 0);
@@ -2724,7 +2735,7 @@ send_packets_to_player(entity_base * player, server * serv,
 
             for (int i = 0; i < serv->tab_list_added_count; i++) {
                 entity_id eid = serv->tab_list_added[i];
-                entity_base * player = resolve_entity(serv, eid);
+                entity_base * player = resolve_entity(eid);
                 assert(player->type == ENTITY_PLAYER);
                 // @TODO(traks) write UUID
                 net_write_ulong(send_cursor, 0);
@@ -2773,47 +2784,56 @@ send_packets_to_player(entity_base * player, server * serv,
     int removed_entity_count = 0;
 
     for (int j = 1; j < MAX_ENTITIES; j++) {
-        tracked_entity * tracked = player->player.tracked_entities + j;
         entity_base * candidate = serv->entities + j;
+        tracked_entity * tracked = player->player.tracked_entities + j;
+        int is_tracking_candidate = (tracked->eid == candidate->eid);
+
+        if ((candidate->flags & ENTITY_IN_USE)
+                && is_tracking_candidate) {
+            // Candidate is a valid entity and we're already tracking it
+            double dx = candidate->x - player->x;
+            double dy = candidate->y - player->y;
+            double dz = candidate->z - player->z;
+            if (dx * dx + dy * dy + dz * dz < 45 * 45) {
+                try_update_tracked_entity(player,
+                        send_cursor, tick_arena, tracked, candidate);
+                continue;
+            }
+        }
+
+        // several states are possible: the candidate isn't a valid entity, or
+        // we aren't tracking it yet, or the currently tracked entity was
+        // removed, or the tracked entity is out of range
 
         if (tracked->eid != 0) {
-            // entity is currently being tracked
-            if ((candidate->flags & ENTITY_IN_USE)
-                    && candidate->eid == tracked->eid) {
-                // entity is still there
-                double dx = candidate->x - player->x;
-                double dy = candidate->y - player->y;
-                double dz = candidate->z - player->z;
-                if (dx * dx + dy * dy + dz * dz < 45 * 45) {
-                    try_update_tracked_entity(player, serv,
-                            send_cursor, tick_arena, tracked, candidate);
-                    continue;
-                }
-            }
-
-            // entity we tracked is gone or too far away
-
+            // remove tracked entity if we were tracking an entity
             if (removed_entity_count == ARRAY_SIZE(removed_entities)) {
                 // no more space to untrack, try again next tick
                 continue;
             }
 
             removed_entities[removed_entity_count] = tracked->eid;
-            player->player.tracked_entities[j].eid = 0;
+            tracked->eid = 0;
             removed_entity_count++;
         }
 
-        if ((candidate->flags & ENTITY_IN_USE) && candidate->eid != player->eid) {
-            // candidate is valid for being newly tracked
+        if ((candidate->flags & ENTITY_IN_USE) && candidate->eid != player->eid
+                && !is_tracking_candidate) {
+            // candidate is a valid entity and wasn't tracked already
             double dx = candidate->x - player->x;
             double dy = candidate->y - player->y;
             double dz = candidate->z - player->z;
 
-            if (dx * dx + dy * dy + dz * dz > 100 * 100) {
+            if (dx * dx + dy * dy + dz * dz > 40 * 40) {
+                // @NOTE(traks) Don't start tracking until close enough. This
+                // radius should be lower than the untrack radius: if the track
+                // radius is larger than the untrack radius, then there's a zone
+                // in which we continuously track and untrack every tick. This
+                // is a waste of bandwidth.
                 continue;
             }
 
-            start_tracking_entity(player, serv,
+            start_tracking_entity(player,
                     send_cursor, tick_arena, tracked, candidate);
         }
     }
@@ -2874,7 +2894,7 @@ send_packets_to_player(entity_base * player, server * serv,
     if (send_cursor->error != 0) {
         // just disconnect the player
         logs("Failed to create packets");
-        disconnect_player_now(player, serv);
+        disconnect_player_now(player);
         goto bail;
     }
 
@@ -2957,7 +2977,7 @@ send_packets_to_player(entity_base * player, server * serv,
     if (final_cursor->error != 0) {
         // just disconnect the player
         logs("Failed to finalise packets");
-        disconnect_player_now(player, serv);
+        disconnect_player_now(player);
         goto bail;
     }
 
@@ -2970,7 +2990,7 @@ send_packets_to_player(entity_base * player, server * serv,
         // EAGAIN means no data sent
         if (errno != EAGAIN) {
             logs_errno("Couldn't send protocol data: %s");
-            disconnect_player_now(player, serv);
+            disconnect_player_now(player);
         }
     } else {
         memmove(final_cursor->buf, final_cursor->buf + send_size,
@@ -2980,4 +3000,19 @@ send_packets_to_player(entity_base * player, server * serv,
 
 bail:
     end_timed_block();
+}
+
+int
+get_player_facing(entity_base * player) {
+    float rot_y = player->rot_y;
+    int int_rot = (int) floor(rot_y / 90.0f + 0.5f) & 0x3;
+    switch (int_rot) {
+    case 0: return DIRECTION_POS_Z;
+    case 1: return DIRECTION_NEG_X;
+    case 2: return DIRECTION_NEG_Z;
+    case 3: return DIRECTION_POS_X;
+    default:
+        assert(0);
+        return -1;
+    }
 }
